@@ -11,7 +11,7 @@ open Microsoft.Extensions.Logging
 open Serilog
 
 type Program() =
-    static member ConfigureServices(builder: WebApplicationBuilder, sessionId: string) =
+    static member ConfigureServices(builder: WebApplicationBuilder, sessionId: string, projectPath: string option, useFsix: bool) =
         // Use Serilog for logging - global logger already configured in main()
         builder.Host.UseSerilog() |> ignore
         
@@ -20,11 +20,23 @@ type Program() =
             new FsiService.FsiService(logger, sessionId)
         )
         |> ignore
+        
+        builder.Services.AddSingleton<FsixDaemonService.FsixDaemonService>(fun serviceProvider ->
+            let logger = serviceProvider.GetRequiredService<ILogger<FsixDaemonService.FsixDaemonService>>()
+            new FsixDaemonService.FsixDaemonService(logger, sessionId, projectPath)
+        )
+        |> ignore
 
+        // Register configuration record
+        builder.Services.AddSingleton<FsiMcpTools.FsixModeConfig>(
+            { FsiMcpTools.FsixModeConfig.UseFsix = useFsix }) |> ignore
+        
         builder.Services.AddSingleton<FsiMcpTools.FsiTools>(fun serviceProvider ->
             let fsiService = serviceProvider.GetRequiredService<FsiService.FsiService>()
+            let fsixService = serviceProvider.GetRequiredService<FsixDaemonService.FsixDaemonService>()
+            let config = serviceProvider.GetRequiredService<FsiMcpTools.FsixModeConfig>()
             let logger = serviceProvider.GetRequiredService<ILogger<FsiMcpTools.FsiTools>>()
-            new FsiMcpTools.FsiTools(fsiService, logger)
+            new FsiMcpTools.FsiTools(fsiService, fsixService, config, logger)
         ) |> ignore
         
         builder
@@ -46,32 +58,123 @@ type Program() =
             
         app.MapGet("/health", Func<string>(fun () -> "Ready to work!"))
         |> ignore
+        
+        // Add simple HTTP POST endpoint for sending F# code
+        app.MapPost("/api/send", Func<Microsoft.AspNetCore.Http.HttpContext, Task<Microsoft.AspNetCore.Http.IResult>>(fun ctx ->
+            task {
+                use reader = new System.IO.StreamReader(ctx.Request.Body)
+                let! body = reader.ReadToEndAsync()
+                
+                try
+                    // Parse JSON body - expecting {"code": "...", "agentName": "...", "useFsix": true/false}
+                    let json = System.Text.Json.JsonDocument.Parse(body)
+                    let root = json.RootElement
+                    
+                    let mutable codeProp = Unchecked.defaultof<System.Text.Json.JsonElement>
+                    if not (root.TryGetProperty("code", &codeProp)) then
+                        return Microsoft.AspNetCore.Http.Results.BadRequest({| status = "error"; message = "Missing 'code' property" |})
+                    else
+                    
+                    let code = codeProp.GetString()
+                    
+                    let mutable agentProp = Unchecked.defaultof<System.Text.Json.JsonElement>
+                    let agentName = 
+                        if root.TryGetProperty("agentName", &agentProp) then
+                            agentProp.GetString()
+                        else
+                            "neovim"
+                    
+                    let mutable useFsixProp = Unchecked.defaultof<System.Text.Json.JsonElement>
+                    let useFsix = 
+                        if root.TryGetProperty("useFsix", &useFsixProp) && useFsixProp.ValueKind = System.Text.Json.JsonValueKind.True then
+                            true
+                        else
+                            false
+                    
+                    // Get appropriate service and send code async (fire-and-forget for speed)
+                    let fsixService = ctx.RequestServices.GetRequiredService<FsixDaemonService.FsixDaemonService>()
+                    
+                    // Start send in background
+                    Task.Run(fun () ->
+                        let result =
+                            if useFsix then
+                                fsixService.SendToFsi(code, FsixDaemonService.FsiInputSource.Api agentName)
+                            else
+                                let fsiService = ctx.RequestServices.GetRequiredService<FsiService.FsiService>()
+                                fsiService.SendToFsi(code, FsiService.FsiInputSource.Api agentName)
+                        
+                        match result with
+                        | Ok _ -> ()
+                        | Error msg -> eprintfn "FSI send error: %s" msg
+                    ) |> ignore
+                    
+                    // Return immediately
+                    return Microsoft.AspNetCore.Http.Results.Ok({| status = "success"; message = "Code sent" |})
+                with ex ->
+                    return Microsoft.AspNetCore.Http.Results.BadRequest({| status = "error"; message = ex.Message |})
+            }
+        ))
+        |> ignore
 
-    static member CreateWebApplication(args: string[], sessionId: string) =
+    static member CreateWebApplication(args: string[], sessionId: string, projectPath: string option, useFsix: bool) =
         let builder = WebApplication.CreateBuilder(args)
-        Program.ConfigureServices(builder, sessionId)
+        Program.ConfigureServices(builder, sessionId, projectPath, useFsix)
         let app = builder.Build()
         Program.ConfigureApp(app)
         app
 
 let createApp (args: string[]) (sessionId: string) =
-    let (regArgs, fsiArgs) = args |> Array.partition (fun arg -> arg.StartsWith("fsi-mcp:") || arg.StartsWith("--contentRoot") || arg.StartsWith("--environment") || arg.StartsWith("--applicationName"))
+    // Check for --use-fsix-daemon flag and --proj/--sln flags
+    let useFsixDaemon = args |> Array.exists (fun arg -> arg = "--use-fsix-daemon" || arg = "fsi-mcp:--use-fsix-daemon")
+    let projectPath =
+        args 
+        |> Array.tryFindIndex (fun arg -> arg.StartsWith("--proj") || arg.StartsWith("--sln"))
+        |> Option.bind (fun idx -> 
+            if idx + 1 < args.Length then Some args.[idx + 1]
+            else None)
     
-    let app = Program.CreateWebApplication(regArgs |> Array.map _.Replace("fsi-mcp:",""), sessionId)
+    let (regArgs, fsiArgs) = args |> Array.partition (fun arg -> 
+        arg.StartsWith("fsi-mcp:") || 
+        arg.StartsWith("--contentRoot") || 
+        arg.StartsWith("--environment") || 
+        arg.StartsWith("--applicationName") ||
+        arg = "--use-fsix-daemon" ||
+        arg.StartsWith("--proj") ||
+        arg.StartsWith("--sln"))
     
-    // Start FSI service
-    let fsiService = app.Services.GetRequiredService<FsiService.FsiService>()
-    let fsiProcess = fsiService.StartFsi(fsiArgs)
+    let app = Program.CreateWebApplication(regArgs |> Array.map _.Replace("fsi-mcp:",""), sessionId, projectPath, useFsixDaemon)
     
-    // Setup cleanup on shutdown
     let lifetime = app.Lifetime
-        
-    lifetime.ApplicationStopping.Register(fun () -> 
-        fsiService.Cleanup()
-    ) |> ignore
+    
+    let fsixServiceWithProject =
+        if useFsixDaemon then
+            // Use fsix daemon mode - get service from DI (now has correct projectPath)
+            let fsixService = app.Services.GetRequiredService<FsixDaemonService.FsixDaemonService>()
+            
+            printfn "⚠️  Warning: fsix daemon mode is experimental"
+            printfn "✨ Starting fsix daemon with project: %s" (projectPath |> Option.defaultValue "none")
+            
+            let fsiProcess = fsixService.StartFsi(fsiArgs)
+            
+            // Setup cleanup on shutdown
+            lifetime.ApplicationStopping.Register(fun () -> 
+                fsixService.Cleanup()
+            ) |> ignore
+            
+            Some fsixService
+        else
+            // Start FSI service normally
+            let fsiService = app.Services.GetRequiredService<FsiService.FsiService>()
+            let fsiProcess = fsiService.StartFsi(fsiArgs)
+            
+            // Setup cleanup on shutdown
+            lifetime.ApplicationStopping.Register(fun () -> 
+                fsiService.Cleanup()
+            ) |> ignore
+            
+            None
     
     Console.CancelKeyPress.Add (fun _ ->
-        fsiService.Cleanup()
         Environment.Exit(0))
     
     let status =
@@ -118,6 +221,21 @@ let createApp (args: string[]) (sessionId: string) =
             } :> Task
         , cts)
     
+    let startFsixConsumer (fsixSvc: FsixDaemonService.FsixDaemonService) (logger: Microsoft.Extensions.Logging.ILogger) (cts: CancellationToken) =
+        Task.Run(fun () ->
+            logger.LogInformation("FSIX consumer started")
+            logger.LogDebug("CONSOLE-CONSUMER: FSIX consumer task started")
+            task {
+                while! inputChannel.Reader.WaitToReadAsync(cts) do
+                    logger.LogDebug("CONSOLE-CONSUMER: Reading from input channel...")
+                    let! line = inputChannel.Reader.ReadAsync(cts)
+                    logger.LogDebug("CONSOLE-CONSUMER: Got line from channel: {Line}", line)
+                    match fsixSvc.SendToFsi(line, FsixDaemonService.FsiInputSource.Console) with
+                    | Ok _       -> ()
+                    | Error msg  -> logger.LogError("Console input error: {Msg}", msg)
+            } :> Task
+        , cts)
+    
     let logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("ConsoleBridge")
 
     // Diagnostic: Log console state at startup
@@ -129,9 +247,18 @@ let createApp (args: string[]) (sessionId: string) =
 
     use cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.ApplicationStopping)
 
-    // Start tasks (they will wait internally for FSI ready)
-    let prodTask = startConsoleProducer logger cts.Token
-    let consTask = startFsiConsumer fsiService logger cts.Token
+    // Start console tasks based on which service is running
+    let (prodTask, consTask) =
+        match fsixServiceWithProject with
+        | Some fsixSvc ->
+            let prod = startConsoleProducer logger cts.Token
+            let cons = startFsixConsumer fsixSvc logger cts.Token
+            (prod, cons)
+        | None ->
+            let fsiService = app.Services.GetRequiredService<FsiService.FsiService>()
+            let prod = startConsoleProducer logger cts.Token
+            let cons = startFsiConsumer fsiService logger cts.Token
+            (prod, cons)
     
     app, Task.WhenAll [| prodTask; consTask |]
 

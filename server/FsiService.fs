@@ -45,14 +45,14 @@ type FsiService(logger: ILogger<FsiService>, sessionId: string) =
         let fsiArgs =
             if args.Length > 1 then
                 let userArgs = args |> Array.skip 1 |> String.concat " "
-                $"fsi {userArgs}"
+                userArgs
             else
-                "fsi"
+                ""
 
         logger.LogDebug("FSI-START: Starting FSI with args: {FsiArgs}", fsiArgs)
         let psi = ProcessStartInfo()
         psi.FileName <- "dotnet"
-        psi.Arguments <- fsiArgs
+        psi.Arguments <- $"fsi {fsiArgs}"
         psi.RedirectStandardInput <- true
         psi.RedirectStandardOutput <- true
         psi.RedirectStandardError <- true
@@ -94,7 +94,7 @@ type FsiService(logger: ILogger<FsiService>, sessionId: string) =
         } |> Async.Start
         
         logger.LogInformation("🚀 FSI started with input/output interception!")
-        logger.LogInformation($"⚙️  FSI command: dotnet {fsiArgs}")
+        logger.LogInformation($"⚙️  FSI command: fsix {fsiArgs}")
         
         proc
 

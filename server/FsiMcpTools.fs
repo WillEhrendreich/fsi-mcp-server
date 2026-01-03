@@ -7,12 +7,54 @@ open ModelContextProtocol.Server
 //this uses SSE transport over http://localhost:5000/sse
 open Microsoft.Extensions.Logging
 
-type FsiTools(fsiService: FsiService.FsiService, logger: ILogger<FsiTools>) =
+type FsixModeConfig = { UseFsix: bool }
+
+type FsiTools(fsiService: FsiService.FsiService, fsixService: FsixDaemonService.FsixDaemonService, config: FsixModeConfig, logger: ILogger<FsiTools>) =
+    
+    let sendCode code (source: obj) =
+        if config.UseFsix then
+            fsixService.SendToFsi(code, source :?> FsixDaemonService.FsiInputSource)
+        else
+            fsiService.SendToFsi(code, source :?> FsiService.FsiInputSource)
+    
+    let syncFile filePath =
+        if config.UseFsix then
+            fsixService.SyncFileToFsi(filePath)
+        else
+            fsiService.SyncFileToFsi(filePath)
+    
+    let getRecentEvents count =
+        if config.UseFsix then
+            fsixService.GetRecentEvents(count) |> Array.map (fun e ->
+                {| EventType = e.EventType; Source = e.Source; Content = e.Content; Timestamp = e.Timestamp; SessionId = e.SessionId |})
+        else
+            fsiService.GetRecentEvents(count) |> Array.map (fun e ->
+                {| EventType = e.EventType; Source = e.Source; Content = e.Content; Timestamp = e.Timestamp; SessionId = e.SessionId |})
+    
+    let getAllEvents () =
+        if config.UseFsix then
+            fsixService.GetAllEvents() |> Array.map (fun e ->
+                {| EventType = e.EventType; Source = e.Source; Content = e.Content; Timestamp = e.Timestamp; SessionId = e.SessionId |})
+        else
+            fsiService.GetAllEvents() |> Array.map (fun e ->
+                {| EventType = e.EventType; Source = e.Source; Content = e.Content; Timestamp = e.Timestamp; SessionId = e.SessionId |})
+    
+    let getSessionId () =
+        if config.UseFsix then
+            fsixService.GetSessionId()
+        else
+            fsiService.GetSessionId()
+    
     [<McpServerTool(Name=McpToolNames.SendFSharpCode)>]
     [<Description("Send F# code to the FSI (F# Interactive) session for execution. Make sure to the statements with ';;' just as you would when interacting with fsi.exe.")>]
     member _.SendFSharpCode(agentName: string, code: string) : string =
         logger.LogDebug("MCP-TOOL: SendFSharpCode called by {AgentName}: {Code}", agentName, code)
-        match fsiService.SendToFsi(code, FsiService.FsiInputSource.Api agentName) with
+        let source:obj = 
+            if config.UseFsix then
+                FsixDaemonService.FsiInputSource.Api agentName :> obj
+            else
+                FsiService.FsiInputSource.Api agentName :> obj
+        match sendCode code source with
         | Ok result ->
             logger.LogDebug("MCP-TOOL: SendFSharpCode succeeded: {Result}", result)
             result
@@ -23,7 +65,7 @@ type FsiTools(fsiService: FsiService.FsiService, logger: ILogger<FsiTools>) =
     [<McpServerTool>]
     [<Description("Load and execute an F# script file (.fsx) in the FSI session. The file is parsed and statements are sent individually.")>]
     member _.LoadFSharpScript(filePath: string) : string = 
-        match fsiService.SyncFileToFsi(filePath) with
+        match syncFile filePath with
         | Ok result -> result
         | Error msg -> $"Error: {msg}"
     
@@ -31,7 +73,7 @@ type FsiTools(fsiService: FsiService.FsiService, logger: ILogger<FsiTools>) =
     [<Description("Get recent FSI events.")>]
     member _.GetRecentFsiEvents(count: int option) : string = 
         let eventCount = defaultArg count 10
-        let events = fsiService.GetRecentEvents(eventCount)
+        let events = getRecentEvents eventCount
         
         if events.Length = 0 then
             "No FSI events available yet. Execute some F# code first."
@@ -44,8 +86,8 @@ type FsiTools(fsiService: FsiService.FsiService, logger: ILogger<FsiTools>) =
     [<Description("Get information about the FSI service status.")>]
     member _.GetFsiStatus() : string =
         
-        let sessionId = fsiService.GetSessionId()
-        let totalEvents = fsiService.GetAllEvents().Length
+        let sessionId = getSessionId()
+        let totalEvents = getAllEvents().Length
         
         let status = [
             $"🚀 FSI Server Status (Session: {sessionId}):"
